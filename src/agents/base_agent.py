@@ -1,19 +1,27 @@
 import asyncio
 from abc import ABC, abstractmethod
+import time
+from typing import List
+import uuid
+
+from src.protocol.messages import StructuredMessage, MessageType
+from src.state_transfer.latent_mas_manager import LatentMASManager
+from src.memory.memory_unit import MemoryUnit
 
 class BaseAgent(ABC):
     """Agent基类"""
     
     def __init__(self, agent_id: str, role: str, 
-                 protocol: ProtocolHandler,
-                 state_transfer: StateTransferModule,
-                 memory: SharedMemoryModule):
+                 protocol,
+                 state_transfer,
+                 memory):
         self.agent_id = agent_id
         self.role = role
         self.protocol = protocol
         self.state_transfer = state_transfer
         self.memory = memory
         self.inbox = asyncio.Queue()
+        self.latent_mas: LatentMASManager = None
         
     async def register(self):
         """注册到系统"""
@@ -28,12 +36,23 @@ class BaseAgent(ABC):
         await self.send_message(hello_msg)
         
     @abstractmethod
-    def get_capability(self) -> AgentCapability:
+    def get_capability(self):
         pass
     
     @abstractmethod
     async def process_task(self, msg: StructuredMessage) -> StructuredMessage:
-        pass
+        if msg.msg_type == MessageType.STATE_TRANSFER and msg.state_offset is not None:
+            upstream = self.latent_mas.consume(msg.state_offset)
+            
+        offset = self.latent_mas.produce(
+            input_text=msg.parameters.get("task", ""),
+            cache_key=msg.task_id
+        )
+        
+        return StructuredMessage(
+            state_offset=offset,
+            state_type=MessageType.STATE_TRANSFER
+        )
     
     async def send_message(self, msg: StructuredMessage):
         """发送结构化消息"""
