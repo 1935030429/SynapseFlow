@@ -7,6 +7,8 @@ from src.runtime.message_bus import MessageBus
 from src.protocol.messages import StructuredMessage, MessageType
 from src.agents.base_agent import BaseAgent
 from src.protocol.router import ProtocolRouter
+from src.evaluation.metrics import TaskMetrics
+from src.runtime.shared_memory import SharedMemoryManager
 
 @dataclass
 class TaskContext:
@@ -30,10 +32,10 @@ class TaskContext:
     finished_at: float = 0
     
     # 指标采集器引用
-    metrics: Any = None
+    metrics: Optional[TaskMetrics] = None
 class Orchestrator:
     """主流程"""
-    def __init__(self, bus: MessageBus, shm, router: ProtocolRouter, agents: List[BaseAgent]):
+    def __init__(self, bus: MessageBus, shm: SharedMemoryManager, router: ProtocolRouter, agents: List[BaseAgent]):
         self.shm = shm
         self.bus = bus
         self.router = router
@@ -47,7 +49,7 @@ class Orchestrator:
         # 记录所有已完成任务的历史（用于查询）
         self.task_history: List[TaskContext] = []
         
-    async def submit_task(self, user_input: str, context: Dict[str, Any], metrics=None):
+    async def submit_task(self, user_input: str, context: Dict[str, Any], metrics: TaskMetrics=None):
         task_id = self.__create_task_id()
         
         task_ctx = TaskContext(
@@ -60,13 +62,20 @@ class Orchestrator:
         self.active_tasks[task_id] = task_ctx
         
         #执行任务
-        result = await self.__execute_task(task_ctx)
+        try:
+            result = await self.__execute_task(task_ctx)
+        except Exception as e:
+            result = {"error": str(e)}
         
         #完成，移入历史记录
         task_ctx.finished_at = time.time()
         self.task_history.append(task_ctx)
         
-        del self.active_tasks[task_id]
+        # del self.active_tasks[task_id]
+        self.active_tasks.pop(task_id, None)
+
+        if metrics:
+            metrics.finish()
         
         return result
         
@@ -104,7 +113,7 @@ class Orchestrator:
         ctx.plan = await self.__planning_phase(ctx)
         
         if not ctx.plan or not ctx.plan.get("steps"):
-            return {"error": "规划失败，无法生成执行步骤"}
+            return {"error": "Fail to plan task, cannot generate execute steps"}
         
         # ──── 阶段2：执行子任务 ────
         await self.__execution_phase(ctx)
@@ -124,9 +133,17 @@ class Orchestrator:
         3. 发送消息并等待回复
         4. 从回复中获取计划（可能在消息体内，也可能在共享内存中）
         """
+        
+        # 2. 找到 Planner（通过角色查找）
+        planner = self.role_map.get("planner")
+        if not planner:
+            raise RuntimeError("没有可用的 Planner Agent")
+
         # 1. 构造消息
         plan_msg = StructuredMessage(
             msg_type=MessageType.TASK_REQUEST,
+            sender_id="orchestrator",
+            receiver_id=planner.agent_id,
             action="plan_task",
             task_id=ctx.task_id,
             parameters={
@@ -135,13 +152,9 @@ class Orchestrator:
             }
         )
         
-        # 2. 找到 Planner（通过角色查找）
-        planner = self.role_map.get("planner")
-        if not planner:
-            raise RuntimeError("没有可用的 Planner Agent")
-        
         # 3. 发送并等待回复
-        response = await self.__send_and_wait(plan_msg, planner.agent_id)
+        # response = await self.__send_and_wait(plan_msg, planner.agent_id)
+        response = await self._send(planner, plan_msg)
         
         if response.msg_type == MessageType.TASK_ERROR:
             return None
@@ -151,6 +164,7 @@ class Orchestrator:
         
         # 5. 记录指标
         if ctx.metrics:
+            ctx.metrics.record_message(plan_msg)
             ctx.metrics.record_message(response)
         
         return plan
@@ -200,7 +214,7 @@ class Orchestrator:
             
             if not ready_steps:
                 # 没有就绪步骤，但有未完成步骤 → 可能存在循环依赖
-                print(f"[ORCH] 警告：检测到可能的循环依赖，剩余步骤: {pending_steps}")
+                print(f"[ORCH] WARN: Detect possible cycle dependency, remaining steps: {pending_steps}")
                 for sid in pending_steps:
                     ctx.failed_steps.add(sid)
                 break
@@ -251,7 +265,6 @@ class Orchestrator:
         
         流程：
         1. 找到能执行这个 action 的 Agent
-        2. 收集上游步骤的 SDE 指针（供下游使用）
         3. 构造消息
         4. 发送并等待结果
         5. 存储结果到上下文中
@@ -263,33 +276,31 @@ class Orchestrator:
         capable_agents = self.router.route_by_action(action)
         
         if not capable_agents:
-            print(f"[ORCH] 步骤 {step_id}: 没有 Agent 能执行 {action}")
+            print(f"[ORCH] Step {step_id}: No Agent can execute {action}")
             ctx.failed_steps.add(step_id)
             return
         
         target_agent_id = capable_agents[0]  # 取第一个，多实例时可做负载均衡
+
+        agent = self.agent_map[target_agent_id]
         
-        # 2. 收集上游步骤的 SDE 指针
-        upstream_sde_offsets = []
-        for dep_id in step.get("depends_on", []):
-            if dep_id in ctx.step_results:
-                dep_response = ctx.step_results[dep_id]
-                if hasattr(dep_response, 'state_offset') and dep_response.state_offset:
-                    upstream_sde_offsets.append(dep_response.state_offset)
+        upstream_context = self._collect_upstream_results(ctx, step)
         
         # 3. 构造消息
         msg = StructuredMessage(
             msg_type=MessageType.TASK_REQUEST,
-            action=action,
+            sender_id="orchestrator",
+            receiver_id=target_agent_id,
             task_id=ctx.task_id,
-            parameters=step,
-            # 传递最近一个上游 SDE 的指针
-            state_offset=upstream_sde_offsets[0] if upstream_sde_offsets else None,
-            state_type="sde" if upstream_sde_offsets else None
+            action=action,
+            parameters={
+                **step,
+                "upstream_results": upstream_context  # 上游结果摘要
+            }
         )
         
         # 4. 发送并等待回复
-        response = await self._send_and_wait(msg, target_agent_id)
+        response = await self._send(agent, msg)
         
         # 5. 记录结果
         ctx.step_results[step_id] = response
@@ -302,12 +313,30 @@ class Orchestrator:
         # 6. 记录指标
         if ctx.metrics:
             ctx.metrics.record_message(msg)
-            if response.state_offset:
-                ctx.metrics.record_sde_transfer(response.state_size)
+            ctx.metrics.record_message(response)
     
     # ================================================================
     # 阶段3：总结
     # ================================================================
+
+    def _collect_upstream_results(self, ctx: TaskContext, step: Dict) -> Dict:
+        """
+        收集上游步骤的结果，作为当前步骤的上下文
+        
+        只传递摘要信息，不传完整数据（完整数据在共享内存中）。
+        """
+        upstream = {}
+        
+        for dep_id in step.get("depends_on", []):
+            if dep_id in ctx.step_results:
+                response = ctx.step_results[dep_id]
+                upstream[dep_id] = {
+                    "action": step.get("action", ""),
+                    "result_type": response.result_type,
+                    "summary": str(response.result_data)[:200] if response.result_data else ""
+                }
+        
+        return upstream
     
     async def __summary_phase(self, ctx: TaskContext) -> Dict[str, Any]:
         """
@@ -319,52 +348,50 @@ class Orchestrator:
         3. 发送给 Summarizer
         4. 返回最终结果
         """
-        # 1. 收集上游 SDE
-        all_sde_offsets = []
-        for step_id in sorted(ctx.completed_steps):
-            result = ctx.step_results.get(step_id)
-            if result and hasattr(result, 'state_offset') and result.state_offset:
-                all_sde_offsets.append(result.state_offset)
+
+        summarizer = self.role_map.get("summarizer")
+        if not summarizer:
+                # 没有 Summarizer，直接返回所有步骤结果
+                return {
+                    "completed": list(ctx.completed_steps),
+                    "failed": list(ctx.failed_steps),
+                    "results": {
+                        sid: self.__extract_data(ctx.step_results[sid])
+                        for sid in ctx.completed_steps
+                    }
+                }
         
-        # 2. 构造总结消息
-        summary_msg = StructuredMessage(
+        # 收集所有步骤结果
+        step_results_summary = {}
+        for step_id in sorted(ctx.completed_steps):
+            response = ctx.step_results[step_id]
+            step_results_summary[step_id] = self.__extract_data(response)
+        
+        # 构造总结消息
+        msg = StructuredMessage(
             msg_type=MessageType.TASK_REQUEST,
-            action="summarize",
+            sender_id="orchestrator",
+            receiver_id=summarizer.agent_id,
             task_id=ctx.task_id,
+            action="summarize",
             parameters={
                 "user_query": ctx.user_input,
                 "total_steps": len(ctx.plan.get("steps", [])),
                 "completed": len(ctx.completed_steps),
                 "failed": len(ctx.failed_steps),
-                "step_results": {
-                    sid: self._extract_data(ctx.step_results[sid])
-                    for sid in ctx.completed_steps
-                }
-            },
-            # 传递最后一个 SDE 指针（Summarizer 用它检索记忆）
-            state_offset=all_sde_offsets[-1] if all_sde_offsets else None,
-            state_type="sde" if all_sde_offsets else None
+                "strategy": ctx.plan.get("strategy", ""),
+                "step_results": step_results_summary
+            }
         )
         
-        # 3. 发送给 Summarizer
-        summarizer = self.role_map.get("summarizer")
-        if not summarizer:
-            # 没有 Summarizer，直接返回原始结果
-            return {
-                "completed": list(ctx.completed_steps),
-                "failed": list(ctx.failed_steps),
-                "results": {
-                    sid: self._extract_data(ctx.step_results[sid])
-                    for sid in ctx.completed_steps
-                }
-            }
-        
-        response = await self._send_and_wait(summary_msg, summarizer.agent_id)
+        # 发送并等待回复
+        response = await self._send(summarizer, msg)
         
         if ctx.metrics:
+            ctx.metrics.record_message(msg)
             ctx.metrics.record_message(response)
         
-        return self._extract_data(response)
+        return self.__extract_data(response)
     
     # ================================================================
     # 通信辅助
@@ -435,17 +462,28 @@ class Orchestrator:
         """查询任务状态"""
         ctx = self.active_tasks.get(task_id)
         if not ctx:
-            return {"error": "任务不存在或已完成"}
+            # 尝试从历史中查找
+            for h in self.task_history:
+                if h.task_id == task_id:
+                    return {
+                        "task_id": task_id,
+                        "status": "completed",
+                        "user_input": h.user_input[:100],
+                        "duration": h.finished_at - h.created_at,
+                        "completed_steps": len(h.completed_steps),
+                        "failed_steps": len(h.failed_steps)
+                    }
+            return {"error": "任务不存在"}
         
-        total = len(ctx.plan.get("steps", [])) if ctx.plan else 0
         return {
             "task_id": task_id,
+            "status": "running",
             "user_input": ctx.user_input[:100],
-            "total_steps": total,
+            "elapsed": time.time() - ctx.created_at,
+            "total_steps": len(ctx.plan.get("steps", [])) if ctx.plan else 0,
             "completed": len(ctx.completed_steps),
             "failed": len(ctx.failed_steps),
-            "pending": total - len(ctx.completed_steps) - len(ctx.failed_steps),
-            "elapsed": time.time() - ctx.created_at
+            "pending": len(ctx.plan.get("steps", [])) - len(ctx.completed_steps) - len(ctx.failed_steps) if ctx.plan else 0
         }
         
     def get_history(self, limit: int = 10) -> List[Dict]:
@@ -460,3 +498,28 @@ class Orchestrator:
             }
             for ctx in self.task_history[-limit:]
         ]
+
+    async def _send(self, agent: BaseAgent, msg: StructuredMessage) -> StructuredMessage:
+        """
+        发送消息给 Agent 并等待回复
+        
+        原型阶段：直接调用 agent.handle_message()
+        后续可替换为：bus.send(msg, target=agent.agent_id)
+        """
+        # 如果配置了 MessageBus，走总线
+        if self.bus:
+            return await self.bus.send(msg, target=agent.agent_id)
+        
+        response = await agent.handle_message(msg)
+        
+        if response is None:
+            # Agent 没有返回，构造错误
+            response = StructuredMessage(
+                msg_type=MessageType.TASK_ERROR,
+                sender_id=agent.agent_id,
+                receiver_id="orchestrator",
+                task_id=msg.task_id,
+                result_data={"error": "Agent 未返回结果"}
+            )
+        
+        return response

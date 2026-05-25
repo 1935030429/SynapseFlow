@@ -184,11 +184,11 @@ class PlannerAgent(BaseAgent):
                         pass
         print(f"[{self.agent_id}] Fail to parse plan, original output: {text[:200]}")
         return {
-        "steps": [],
-        "parallel_groups": [],
-        "strategy": "parse_failed",
-        "error": "fail to parse plan",
-        "raw_output": text[:500]
+            "steps": [],
+            "parallel_groups": [],
+            "strategy": "parse_failed",
+            "error": "fail to parse plan",
+            "raw_output": text[:500]
         }
         
         
