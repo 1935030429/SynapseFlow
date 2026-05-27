@@ -7,8 +7,8 @@ import json
 class SummarizerAgent(BaseAgent):
     """总结Agent"""
 
-    def __init__(self) -> None:
-        super().__init__()
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
     
     def get_capability(self) -> List[str]:
         return ["summarize", "generate_report"]

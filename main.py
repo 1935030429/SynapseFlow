@@ -70,14 +70,14 @@ async def run_interactive_mode(config):
     from src.runtime.message_bus import MessageBus
     from src.runtime.orchestrator import Orchestrator
     from src.protocol.router import ProtocolRouter
-    from src.state_transfer.sde_manager import SDEManager
+    from Project.SynapseFlow.src.state_transfer.latent_thoughts import SDEManager
     from src.memory.memory_store import MemoryStore
     from src.memory.memory_retrieval import HybridRetrieval
     from src.memory.memory_graph import MemoryGraph
     from src.agents.planner import PlannerAgent
     from src.agents.retriever import RetrieverAgent
     from src.agents.executor import ExecutorAgent
-    from src.agents.summarizer import SummarizerAgent
+    from src.agents.summary import SummarizerAgent
     from src.evaluation.metrics import TaskMetrics
     
     print("[INIT] 正在初始化系统...")
@@ -164,6 +164,7 @@ async def run_interactive_mode(config):
                 },
                 metrics=metrics
             )
+            
             
             metrics.finish()
             

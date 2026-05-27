@@ -100,7 +100,7 @@ class RetrieverAgent(BaseAgent):
                     "memory_sufficient": memory_sufficient
                 }
             },
-            result_type="shm_pointer",
+            result_type="inline",
             memory_refs=[m.memory_id for m in memory_results],
             receiver_id=msg.sender_id
         )

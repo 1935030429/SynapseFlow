@@ -1,6 +1,7 @@
 import asyncio
 from dataclasses import dataclass, field
 import time
+import traceback
 from typing import Any, Dict, List, Optional
 from src.runtime.message_bus import MessageBus
 
@@ -35,7 +36,7 @@ class TaskContext:
     metrics: Optional[TaskMetrics] = None
 class Orchestrator:
     """主流程"""
-    def __init__(self, bus: MessageBus, shm: SharedMemoryManager, router: ProtocolRouter, agents: List[BaseAgent]):
+    def __init__(self, bus: MessageBus = None, shm: SharedMemoryManager = None, router: ProtocolRouter = None, agents: List[BaseAgent] = []):
         self.shm = shm
         self.bus = bus
         self.router = router
@@ -66,6 +67,8 @@ class Orchestrator:
             result = await self.__execute_task(task_ctx)
         except Exception as e:
             result = {"error": str(e)}
+            print(e)
+            traceback.print_exc()
         
         #完成，移入历史记录
         task_ctx.finished_at = time.time()
@@ -342,30 +345,44 @@ class Orchestrator:
         """
         将所有子任务结果发送给 Summarizer 进行总结
         
-        流程：
-        1. 收集所有已完成步骤的 SDE 指针
-        2. 构造总结消息
-        3. 发送给 Summarizer
-        4. 返回最终结果
+        构造的消息中包含：
+        - 用户原始查询
+        - 每个已完成步骤的结果摘要
+        - 失败步骤的信息
         """
-
         summarizer = self.role_map.get("summarizer")
         if not summarizer:
-                # 没有 Summarizer，直接返回所有步骤结果
-                return {
-                    "completed": list(ctx.completed_steps),
-                    "failed": list(ctx.failed_steps),
-                    "results": {
-                        sid: self.__extract_data(ctx.step_results[sid])
-                        for sid in ctx.completed_steps
-                    }
+            # 没有 Summarizer，直接返回所有步骤结果
+            return {
+                "completed": list(ctx.completed_steps),
+                "failed": list(ctx.failed_steps),
+                "results": {
+                    sid: self.__extract_data(ctx.step_results[sid])
+                    for sid in ctx.completed_steps
                 }
+            }
         
         # 收集所有步骤结果
         step_results_summary = {}
         for step_id in sorted(ctx.completed_steps):
             response = ctx.step_results[step_id]
             step_results_summary[step_id] = self.__extract_data(response)
+
+        # # 收集所有步骤中产生的记忆 ID
+        # all_memory_ids = []
+        # for step_id in ctx.completed_steps:
+        #     response = ctx.step_results[step_id]
+        #     if response.memory_refs:
+        #         all_memory_ids.extend(response.memory_refs)
+
+        # # 总结完成后，建立证据链
+        # if self.memory_graph and all_memory_ids:
+        #     for mid in all_memory_ids:
+        #         self.memory_graph.add_edge(
+        #             parent_id=mid,
+        #             child_id=final_memory_id,
+        #             relation="evidence"
+        #         )
         
         # 构造总结消息
         msg = StructuredMessage(

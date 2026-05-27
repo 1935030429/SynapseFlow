@@ -1,0 +1,38 @@
+# config.yaml
+
+# 模型配置
+model:
+  path: "/home/yj2025/model/Qwen/Qwen3-8B"
+  tensor_parallel_size: 1
+  gpu_memory_utilization: 0.9
+
+# 共享内存
+shared_memory:
+  size_mb: 256
+
+# 记忆
+memory:
+  persist_dir: "Project/SynapseFlow/memory_store"
+
+# 沙箱
+sandbox:
+  type: "process"  # process / docker / nsjail
+  timeout: 30
+
+# Agent 配置（哪些 Agent 启用）
+agents:
+  planner:
+    enabled: true
+    latent_steps: 50
+  retriever:
+    enabled: true
+  executor:
+    enabled: false    # 可选，不需要就关掉
+  summarizer:
+    enabled: true
+
+# 实验配置
+experiment:
+  mode: "both"       # text / structured / both
+  task_count: 10
+  result_dir: "./results"
